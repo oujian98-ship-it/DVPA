@@ -47,9 +47,14 @@ def _compositions(total, parts):
 
 
 class DecisionValueController:
-    def __init__(self, protocol):
+    def __init__(self, protocol, energy_predictor=None):
         self.protocol = protocol
         self.cfg = protocol.config["controller"]
+        if self.cfg["voi_explore_p_only"] != (energy_predictor is not None):
+            raise ValueError("Online energy VOI requires the audited offline predictor")
+        self.energy_predictor = energy_predictor
+        self.last_energy_ranking = None
+        self.last_energy_mc_seconds = 0.0
         units = self.cfg["simplex_units"]
         floor = protocol.p_min
         self.grid = [
@@ -59,6 +64,16 @@ class DecisionValueController:
 
     def static_layer_weights(self):
         return spatial_optimum(list(self.protocol.dimensions.values()), self.protocol.p_min)
+
+    def layer_weights(self, costs):
+        policy = self.cfg["layer_policy"]
+        if policy == "p_dim" or self.cfg["mode"] == "time_only":
+            return np.broadcast_to(self.static_layer_weights(), np.shape(costs))
+        optimum = spatial_optimum(costs, self.protocol.p_min)
+        if policy == "p_mix":
+            mix = self.cfg["layer_mix"]
+            return (1-mix)*self.static_layer_weights() + mix*optimum
+        return optimum
 
     def spatial_candidates(self, current_costs):
         if self.cfg["mode"] == "time_only":
@@ -189,8 +204,11 @@ class DecisionValueController:
 
     def choose(self, t, feedback, remaining):
         started = time.perf_counter()
-        if feedback.prepared_round != t:
+        if feedback.prepared_round != t or feedback.last_observed != t - 1:
             raise ValueError("Only previous DP history may enter current action")
+        if self.energy_predictor is not None:
+            self.last_energy_ranking = dict(round=t, status="warmup", candidates=[])
+            self.last_energy_mc_seconds = 0.0
         remaining = np.asarray(remaining, dtype=float)
         current = feedback.expected_costs(
             feedback.pred_mean, feedback.pred_cov, [t], origin=t
@@ -207,9 +225,21 @@ class DecisionValueController:
                 feedback.history_hash,
             )
 
-        if warm or mode == "static":
-            z = self.protocol.z0
+        fixed = self.cfg["fixed_precision_schedule"]
+        if warm or mode == "static" or fixed is not None:
+            z = self.protocol.z0 if fixed is None else fixed[t - 1]
             p = self.static_layer_weights()
+            if fixed is not None and not warm:
+                current = feedback.expected_costs(
+                    feedback.pred_mean, feedback.pred_cov, [t], origin=t,
+                    quadrature_nodes=self.cfg["ranking_quadrature_nodes"],
+                )[0, 0]
+                if self.cfg["layer_policy"] is None:
+                    gamma = self.cfg["layer_gamma"]
+                    dimensions = np.asarray(list(self.protocol.dimensions.values()), dtype=float)
+                    p = spatial_optimum(dimensions**(1-gamma) * current**gamma, self.protocol.p_min)
+                else:
+                    p = self.layer_weights(current)
             chosen = action(z, p)
             log = dict(
                 round=t,
@@ -226,10 +256,13 @@ class DecisionValueController:
                 tower_correction=0.0,
                 working_mutual_information=0.0,
                 objective=float(np.sum(current / p) / z),
-                selected_tail_profile="public_uniform",
+                selected_tail_profile="public_uniform" if fixed is None else "fixed_schedule",
                 fallback_reason="",
                 controller_seconds=time.perf_counter() - started,
             )
+            if self.cfg["tail_solver"] == "convex":
+                log.update(convex_fallbacks=0, convex_voi_changed=False,
+                           convex_voi_margin=0.0, convex_reference_z=z)
             if self.cfg["ranking_enabled"]:
                 from .dvpa_ranking import blank_log
 
@@ -249,6 +282,10 @@ class DecisionValueController:
                     selected_action=chosen.as_dict(),
                 )
             return chosen, log
+        if self.cfg["tail_solver"] == "convex":
+            from .dvpa_convex import choose_convex
+
+            return choose_convex(self, t, feedback, remaining, started)
         if self.cfg["ranking_enabled"]:
             from .dvpa_ranking import choose_stable
 

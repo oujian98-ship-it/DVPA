@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from .brdp_source_protocol import (
 )
 from .brdp_source_runner import _json, _private_rngs
 from .data import split_checksum
-from .dvpa_config import ROOT, load_config, public_preflight, resolve, smoke_config
+from .dvpa_config import DEFAULT_CONFIG, ROOT, load_config, public_preflight, resolve, smoke_config
 from .dvpa_controller import DecisionValueController
 from .dvpa_feedback import DPHistoryFeedback
 from .dvpa_filter import GroupRDPFilter, VERSION, digest
@@ -28,7 +29,7 @@ from .layer_registry import LayerRegistry
 from .metrics import evaluate
 from .st_runner import write_csv
 from .upstream_runner import SOURCE, source_model
-from .dvpa_public_training import evaluation_record as train_public_evaluation
+from .dvpa_public_training import client_training_count, evaluation_record as train_public_evaluation
 
 
 def inside_output(output):
@@ -58,13 +59,20 @@ def _snapshot(out):
 
 
 def run(config, output):
+    run_started = perf_counter()
     cfg = resolve(config)
     protocol = public_preflight(cfg)  # BEFORE dataset access.
+    predictor, gate_bytes = None, None
+    if cfg["controller"]["voi_explore_p_only"]:
+        from .dvpa_energy_voi import load_energy_gate
+
+        predictor, gate_bytes = load_energy_gate(cfg)
     validation_proof = None
     forecast_proof = None
     if (
         cfg["feedback"]["utility_proxy"] == "public_curvature_signal"
         and cfg["base"].get("dataset_mode") != "synthetic"
+        and "public_test_count" not in cfg["base"]
     ):
         if "public_train_file" in cfg["base"]:
             from .dvpa_public_training import verify_validation as verify_public_validation
@@ -77,6 +85,9 @@ def run(config, output):
             forecast_proof = verify_forecast_validation(cfg)
     out = inside_output(output)
     out.mkdir(parents=True, exist_ok=False)
+    if gate_bytes is not None:
+        (out / "energy_gate.json").write_bytes(gate_bytes)
+        (out / "energy_ranking").mkdir()
     (out / "config.yaml").write_text(
         yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8"
     )
@@ -141,27 +152,35 @@ def run(config, output):
     )
     ledger = GroupRDPFilter(protocol)
     feedback = DPHistoryFeedback(protocol)
-    controller = DecisionValueController(protocol)
+    controller = DecisionValueController(protocol, predictor)
+    profile = feedback.energy is not None or cfg["controller"]["layer_policy"] is not None
+    timings = []
     public_proxy = None
+    from .dvpa_test_public64 import evaluation_data
+
+    test, official_evaluation = evaluation_data(base, test)
+    if official_evaluation is not None:
+        _json(out / "evaluation_protocol.json", official_evaluation)
     if cfg["feedback"]["utility_proxy"] == "public_curvature_signal":
-        if "public_train_file" in base:
+        if "public_test_count" in base:
+            from .dvpa_test_public64 import PublicCurvatureProxy
+        elif "public_train_file" in base:
             from .dvpa_public_training import PublicCurvatureProxy
         else:
             from .dvpa_dataset_support import PublicCurvatureProxy
         from torch.utils.data import Subset
 
         public_proxy = PublicCurvatureProxy(cfg)
-        if base.get("dataset_mode") != "synthetic":
+        if (base.get("dataset_mode") != "synthetic" and "validation_count" not in base
+                and "public_test_count" not in base):
             if len(test) != 10000:
                 raise ValueError(
                     "Full official test split required before public reservation"
                 )
             test = Subset(test, public_proxy.final_indices)
         shutil.copyfile(public_proxy.path, out / "public_proxy_data.pt")
-        _json(
-            out / "evaluation_protocol.json",
-            train_public_evaluation(base, public_proxy.sha)
-            if "public_train_file" in base else dict(
+        if "public_test_count" not in base:
+            evaluation = train_public_evaluation(base, public_proxy.sha) if "public_train_file" in base else dict(
                 dataset=base["dataset"].upper(),
                 public_examples=1000,
                 final_evaluation_examples=len(test),
@@ -169,8 +188,8 @@ def run(config, output):
                 public_data_sha256=public_proxy.sha,
                 original_test_has_historical_evaluations=True,
                 scope="9000 held out from this iteration proxy calibration; old full-test scores are historical",
-            ),
-        )
+            )
+            _json(out / "evaluation_protocol.json", evaluation)
         (out / "public_proxy").mkdir()
         if validation_proof is not None:
             _json(out / "public_validation.json", validation_proof)
@@ -189,13 +208,18 @@ def run(config, output):
     )
     try:
         for t in range(1, base["rounds"] + 1):
+            round_started = perf_counter()
             feedback.prepare(t)
+            public_started = perf_counter()
             if public_proxy is not None:
                 proxy_report = public_proxy.report(model, t)
                 feedback.set_public_coefficients(t, proxy_report)
                 proxy_report.update(feedback.public_forecast_record())
                 _json(out / "public_proxy" / f"round_{t:03d}.json", proxy_report)
+            public_seconds = perf_counter() - public_started if public_proxy is not None else 0.0
             action, decision = controller.choose(t, feedback, ledger.remaining())
+            if predictor is not None:
+                _json(out / "energy_ranking" / f"round_{t:03d}.json", controller.last_energy_ranking)
             certified = ledger.certify(action)
             receipt = ledger.reserve(certified)
             # Write-ahead receipt. A crash must never refund/reuse this charge.
@@ -243,7 +267,17 @@ def run(config, output):
             published = {n: v.detach().cpu().clone() for n, v in released.items()}
             torch.save(published, out / "released" / f"round_{t:03d}.pt")
             registry.apply(model, released)
+            feedback_started = perf_counter()
             observations.extend(feedback.observe(t, published, certified))
+            feedback_seconds = perf_counter() - feedback_started
+            if profile:
+                timings.append(dict(round=t, public_curvature_seconds=public_seconds,
+                                    feedback_seconds=feedback_seconds,
+                                    controller_seconds=decision["controller_seconds"],
+                                    mc_seconds=controller.last_energy_mc_seconds,
+                                    round_seconds=perf_counter()-round_started,
+                                    elapsed_seconds=perf_counter()-run_started))
+                write_csv(out / "controller_timing.csv", timings)
             decisions.append(decision)
             loss, acc = evaluate(model, test, device)
             rows.append(
@@ -260,6 +294,8 @@ def run(config, output):
                     history_hash=feedback.history_hash,
                 )
             )
+            if "validation_count" in base:
+                rows[-1].update(validation_accuracy=acc, validation_cross_entropy=loss)
             write_csv(out / "rounds.csv", rows)
             write_csv(out / "decisions.csv", decisions)
             if observations:
@@ -330,13 +366,18 @@ def run(config, output):
         guarantee="single-run fixed group caps for all histories; path values are diagnostics",
         final_history_hash=feedback.history_hash,
     )
+    if official_evaluation is not None:
+        summary.update({key: official_evaluation[key] for key in
+                        ("evaluation_split", "public_source", "evaluation_examples", "client_training_examples")})
     if public_proxy is not None:
         summary["evaluation_examples"] = len(test)
         summary["utility_proxy"] = "public_curvature_signal"
         summary["public_data_sha256"] = public_proxy.sha
         if "public_train_file" in base:
-            summary["client_training_examples"] = (60000 - base.get("public_train_count", 1000))
+            summary["client_training_examples"] = client_training_count(base)
             summary["public_source"] = "official_training_split"
+            if "validation_count" in base:
+                summary["evaluation_split"] = "independent_validation"
         if cfg["feedback"]["curvature_forecast"] != "hold_current":
             summary["curvature_forecast"] = cfg["feedback"]["curvature_forecast"]
     if cfg["controller"]["ranking_enabled"]:
@@ -357,7 +398,7 @@ def run(config, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--smoke", action="store_true")

@@ -20,18 +20,23 @@ def idx(path, offset):
     with opener(path, 'rb') as f:
         return np.frombuffer(f.read(), dtype=np.uint8, offset=offset).copy()
 
+def load_mnist_split(root, name, split):
+    if name not in {'fmnist', 'mnist'} or split not in {'train', 'test'}:
+        raise ValueError('Expected MNIST/FMNIST and a single official split')
+    root = Path(root)
+    folder = root/'fashion-mnist-master'/'data'/('fashion' if name == 'fmnist' else 'mnist')
+    if name == 'mnist' and not any(folder.glob('train-images-idx3-ubyte*')):
+        folder = root/'MNIST'/'raw'
+    prefix = 'train' if split == 'train' else 't10k'
+    x = idx(folder/f'{prefix}-images-idx3-ubyte.gz', 16).reshape(-1, 1, 28, 28)
+    y = idx(folder/f'{prefix}-labels-idx1-ubyte.gz', 8)
+    return TensorDataset(normalize_images(x), torch.from_numpy(y).long())
+
 def load_data(config):
     root = Path(config.get('root', 'D:/data'))
     name = config['dataset']
     if name in {'fmnist', 'mnist'}:
-        folder = root/'fashion-mnist-master'/'data'/('fashion' if name == 'fmnist' else 'mnist')
-        if name == 'mnist' and not (folder/'train-images-idx3-ubyte.gz').exists() and not (folder/'train-images-idx3-ubyte').exists():
-            folder = root/'MNIST'/'raw'
-        def read(prefix):
-            x = idx(folder/f'{prefix}-images-idx3-ubyte.gz', 16).reshape(-1, 1, 28, 28)
-            y = idx(folder/f'{prefix}-labels-idx1-ubyte.gz', 8)
-            return normalize_images(x), torch.from_numpy(y).long()
-        train, test = read('train'), read('t10k')
+        train, test = (load_mnist_split(root, name, split).tensors for split in ('train', 'test'))
     elif name == 'cifar10':
         folder = root/'cifar-10-python'/'cifar-10-batches-py'
         def read(files):

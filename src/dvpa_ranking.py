@@ -283,3 +283,19 @@ def ranking_summary(decisions):
         ),
         scope="empirical numerical diagnostics, not proof of task utility or optimality",
     )
+
+
+def confirm_energy_gain(proposal, confirmation, current_delta, gap, minimum):
+    """Rank paired differences, then test the winner on disjoint MC batches."""
+    proposal_gain = proposal - proposal[0] - current_delta
+    winner = int(np.argmax(proposal_gain))
+    mean = error = lower = None
+    if winner and proposal_gain[winner] > 0 and confirmation is not None:
+        baseline, alternative = confirmation(winner)
+        gains = alternative - baseline - current_delta[winner]
+        mean = float(gains.mean())
+        error = float(gains.std(ddof=1) / np.sqrt(len(gains)))
+        lower = mean - gap*error
+    selected = winner if lower is not None and lower > minimum else 0
+    return selected, winner, proposal_gain, mean, error, lower
+

@@ -25,6 +25,7 @@ def test_jobs_share_training_and_caps_preserve_full_method_labels():
     for seed in [42, 43, 44]:
         selected = [j for j in jobs if j["seed"] == seed]
         base = selected[0]["config"]["base"]
+        assert selected[0]["config"]["feedback"]["forecast_horizon"] == "full"
         for j in selected[1:]:
             assert all(
                 j["config"][key] == v for key, v in base.items() if key != "method"

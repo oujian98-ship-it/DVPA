@@ -25,6 +25,7 @@ from .brdp_source_protocol import (
     validate_config,
 )
 from .data import split_checksum
+from .dvpa_public_training import client_training_count
 from .layer_registry import LayerRegistry
 from .upstream_runner import source_model
 
@@ -140,7 +141,7 @@ def audit(directory):
     expected_count = (
         max(40 * cfg["clients"], cfg.get("synthetic_samples", 600))
         if cfg.get("dataset_mode") == "synthetic"
-        else ((60000 - cfg.get("public_train_count", 1000)) if "public_train_file" in cfg else 60000)
+        else client_training_count(cfg)
     )
     if sorted(all_ids) != list(range(expected_count)):
         raise ValueError("Partition coverage mismatch")
@@ -285,11 +286,15 @@ def audit(directory):
     ):
         raise ValueError("Summary scope/status mismatch")
     if "public_train_file" in cfg and (
-        summary.get("evaluation_examples") != 10000
-        or summary.get("client_training_examples") != (60000 - cfg.get("public_train_count", 1000))
+        summary.get("evaluation_examples") != cfg.get("validation_count", 10000)
+        or summary.get("client_training_examples") != client_training_count(cfg)
         or summary.get("public_source") != "official_training_split"
+        or ("validation_count" in cfg and summary.get("evaluation_split") != "independent_validation")
     ):
         raise ValueError("Training-public summary data counts mismatch")
+    from .dvpa_test_public64 import verify_evaluation
+
+    verify_evaluation(cfg, root, summary)
     _close(summary["non_gaussian_layer_releases"], non_gaussian, "summary shape count")
     _close(
         summary["final_test_accuracy"],

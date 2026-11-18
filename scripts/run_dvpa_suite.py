@@ -13,13 +13,16 @@ import xml.etree.ElementTree as ET
 
 from src.brdp_source_runner import _json
 from src.dvpa_audit import audit
-from src.dvpa_config import ROOT, load_config, public_preflight, smoke_config
+from src.dvpa_config import DEFAULT_CONFIG, ROOT, load_config, public_preflight, resolve, smoke_config
 from src.dvpa_runner import inside_output, run
+from src.dvpa_test_public64 import configure
 
 TEST_FILES = [
     "test_dvpa_datasets.py",
     "test_dvpa_filter.py",
     "test_dvpa_controller.py",
+    "test_dvpa_convex.py",
+    "test_dvpa_energy.py",
     "test_dvpa_information_weight.py",
     "test_dvpa_train_public.py",
     "test_train_public64.py",
@@ -55,6 +58,10 @@ def manifest():
         ROOT / "scripts/check_dvpa_ranking.py",
         ROOT / "scripts/check_dvpa_proxy.py",
         ROOT / "scripts/check_dvpa_forecast.py",
+        ROOT / "scripts/diagnose_energy.py",
+        ROOT / "scripts/compare_energy_predictors.py",
+        ROOT / "scripts/energy_voi_replay.py",
+        ROOT / "scripts/run_dvpa_v2.py",
         ROOT / "configs/dvpa_fmnist.yaml",
         ROOT / "configs/brdp_source_gaussian_joint_seed42.yaml",
     }
@@ -199,7 +206,9 @@ def verify_formal(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/dvpa_fmnist_local_seed42.yaml")
+    parser.add_argument("--config")
+    parser.add_argument("--official-test64", action="store_true",
+                        help="Apply the new split to an explicitly supplied historical config")
     parser.add_argument("--output")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -210,7 +219,9 @@ def main():
         parser.error(
             "Resume unsupported: private persistent client states are not public artifacts"
         )
-    cfg = load_config(args.config)
+    cfg = load_config(args.config or DEFAULT_CONFIG)
+    if args.official_test64:
+        cfg = resolve(configure(cfg))
     if args.smoke:
         cfg = smoke_config(cfg)
     if args.preview:

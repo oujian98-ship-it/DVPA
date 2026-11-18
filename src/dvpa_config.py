@@ -13,9 +13,12 @@ from .brdp_source_protocol import preflight, validate_config
 from .dvpa_filter import VERSION, sgm_cost
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "configs/dvpa_hfull.yaml"
 DIMENSIONS = dict(conv1=832, conv2=51264, fc1=524800, fc=5130)
 DEFAULTS = dict(
     feedback=dict(
+        feedback_mode="legacy_direction",
+        energy_state="log_ar1_grid_v1",
         warmup_rounds=3,
         basis="fixed_after_warmup",
         state="two_phase_joint_gaussian",
@@ -39,6 +42,7 @@ DEFAULTS = dict(
         public_proxy_validation=None,
         public_proxy_probes=16,
         curvature_forecast="hold_current",
+        curvature_mode="normalized",
         forecast_ema=0.25,
         forecast_damping=0.75,
         forecast_clip=0.1,
@@ -46,6 +50,12 @@ DEFAULTS = dict(
         forecast_validation=None,
     ),
     controller=dict(
+        curvature_only=False,
+        layer_policy=None,
+        layer_mix=0.25,
+        voi_explore_p_only=False,
+        energy_gate_file=None,
+        energy_gate_sha256=None,
         mode="decision_value",
         virtual_observations=64,
         quadrature_nodes=12,
@@ -54,6 +64,9 @@ DEFAULTS = dict(
         p_min=0.02,
         simplex_units=6,
         tail="finite_full_remaining_rollout",
+        tail_solver="templates",
+        fixed_precision_schedule=None,
+        layer_gamma=None,
         tail_profiles=[
             "uniform",
             "front_loaded",
@@ -143,6 +156,35 @@ def resolve(config):
         )
     if f["extra_covariance"] not in {"dp_innovation", "public_bound"}:
         raise ValueError("Unknown covariance model")
+    from .dvpa_energy_feedback import ENERGY_STATE
+
+    if f["feedback_mode"] not in {"legacy_direction", "energy"} or f["energy_state"] != ENERGY_STATE:
+        raise ValueError("Unknown feedback or energy state")
+    if type(c["curvature_only"]) is not bool or type(c["voi_explore_p_only"]) is not bool:
+        raise ValueError("Invalid DVPA v2 switches")
+    policy = c["layer_policy"]
+    if policy not in {None, "p_dim", "p_curv", "p_legacy", "p_mix"}:
+        raise ValueError("Unknown layer allocation policy")
+    if type(c["layer_mix"]) not in (float, int) or not 0 <= c["layer_mix"] <= 1:
+        raise ValueError("Invalid layer mix")
+    if policy is not None and (c["tail_solver"] != "convex" or c["mode"] != "frozen_info"):
+        raise ValueError("Explicit allocation policies require frozen-info convex planning")
+    if (policy == "p_legacy" and c["curvature_only"]) or (policy in {"p_curv", "p_mix"}
+            and f["utility_proxy"] != "public_curvature_signal"):
+        raise ValueError("Allocation policy and curvature source disagree")
+    if f["feedback_mode"] == "energy" and (not c["curvature_only"]
+            or c["tail_solver"] != "convex" or c["mode"] not in {"frozen_info", "time_only"}):
+        raise ValueError("Energy feedback uses a direction-free convex baseline")
+    if c["voi_explore_p_only"]:
+        path, sha = c["energy_gate_file"], c["energy_gate_sha256"]
+        if (f["feedback_mode"] != "energy" or c["mode"] != "frozen_info"
+                or f["curvature_mode"] != "absolute_scale" or c["information_value_weight"] != 1
+                or policy not in (None, "p_curv") or c["fixed_precision_schedule"] is not None
+                or not isinstance(path, str) or not path or not (ROOT / path).resolve().is_relative_to(ROOT)
+                or not isinstance(sha, str) or len(sha) != 64 or any(x not in "0123456789abcdef" for x in sha)):
+            raise ValueError("Energy VOI requires a pinned A/B/C gate and the calibrated fixed-z comparison")
+    elif c["energy_gate_file"] is not None or c["energy_gate_sha256"] is not None:
+        raise ValueError("Unused energy gate")
     if f["utility_proxy"] not in {"dimension_signal", "public_curvature_signal"}:
         raise ValueError("Unknown utility proxy")
     if f["curvature_forecast"] not in {"hold_current", "damped_log_trend"}:
@@ -161,17 +203,19 @@ def resolve(config):
         or not isinstance(f["forecast_clip"], (int, float))
         or not math.isfinite(f["forecast_clip"])
         or f["forecast_clip"] <= 0
-        or type(f["forecast_horizon"]) is not int
-        or not 1 <= f["forecast_horizon"] <= 25
+        or (
+            f["forecast_horizon"] != "full"
+            and (type(f["forecast_horizon"]) is not int or not 1 <= f["forecast_horizon"] <= 25)
+        )
     ):
         raise ValueError("Invalid forecast bound/horizon")
+    test64 = "public_test_count" in cfg["base"]
     if f["curvature_forecast"] != "hold_current":
         path = f["forecast_validation"]
         if (
             f["utility_proxy"] != "public_curvature_signal"
-            or not isinstance(path, str)
-            or not path
-            or not (ROOT / path).resolve().is_relative_to(ROOT)
+            or (not test64 and (not isinstance(path, str) or not path
+                or not (ROOT / path).resolve().is_relative_to(ROOT)))
         ):
             raise ValueError(
                 "History forecast requires public curvature and an inside-BR_DP validation path"
@@ -182,7 +226,8 @@ def resolve(config):
     ):
         raise ValueError("Public curvature needs 2..128 probes")
     if f["utility_proxy"] == "public_curvature_signal":
-        for key in ("public_proxy_file", "public_proxy_validation"):
+        keys = ("public_proxy_file",) if test64 else ("public_proxy_file", "public_proxy_validation")
+        for key in keys:
             value = f[key]
             if (
                 not isinstance(value, str)
@@ -197,10 +242,24 @@ def resolve(config):
             or any(c not in "0123456789abcdef" for c in sha)
         ):
             raise ValueError("Pin the public proxy artifact SHA256")
+        if test64 and (f["public_proxy_file"] != cfg["base"]["evaluation_public_file"]
+                       or sha != cfg["base"]["evaluation_public_sha256"]):
+            raise ValueError("The curvature proxy must be the reserved official test64 package")
         if f["extra_covariance"] != "dp_innovation":
             raise ValueError("Public proxy study preserves second-version covariance")
     if c["mode"] not in {"decision_value", "frozen_info", "static", "entropy", "time_only", "layer_only"}:
         raise ValueError("Unknown controller mode")
+    if f["curvature_mode"] not in {"normalized", "absolute_scale"}:
+        raise ValueError("Unknown curvature scale mode")
+    if f["curvature_mode"] == "absolute_scale" and f["utility_proxy"] != "public_curvature_signal":
+        raise ValueError("Absolute scale requires the public curvature proxy")
+    if c["tail_solver"] not in {"templates", "convex"}:
+        raise ValueError("Unknown time planner")
+    if c["tail_solver"] == "convex" and (
+        c["mode"] not in {"time_only", "frozen_info", "decision_value"}
+        or c["ranking_enabled"] or c["local_search_enabled"]
+    ):
+        raise ValueError("Convex planner uses its own candidate and validation procedure")
     if (
         isinstance(c["information_value_weight"], bool)
         or not isinstance(c["information_value_weight"], (int, float))
@@ -235,6 +294,17 @@ def resolve(config):
                 raise ValueError(f"Invalid integer {key}")
     if f["warmup_rounds"] > base["rounds"] or c["virtual_observations"] % 2:
         raise ValueError("Invalid warmup or antithetic observation count")
+    schedule, gamma = c["fixed_precision_schedule"], c["layer_gamma"]
+    if schedule is not None or gamma is not None:
+        if (
+            not isinstance(schedule, list) or len(schedule) != base["rounds"]
+            or any(type(z) not in (float, int) or not math.isfinite(z) or z <= 0 for z in schedule)
+            or (policy is None and (type(gamma) not in (float, int) or not math.isfinite(gamma) or not 0 <= gamma <= 1))
+            or (policy is not None and gamma is not None)
+            or c["mode"] != "frozen_info" or c["tail_solver"] != "convex"
+            or c["information_value_weight"] != 0
+        ):
+            raise ValueError("A fixed schedule requires positive precisions and one frozen-info layer allocation rule")
     if (
         type(c["ranking_enabled"]) is not bool
         or c["ranking_top_k"] < 2
@@ -561,6 +631,16 @@ def public_preflight(config, dimensions=None):
         np.arange(1, protocol.rounds + 1), protocol.caps
     )
     protocol.z_floor = cfg["privacy"]["floor_precision_ratio"] * protocol.z0
+    fixed = cfg["controller"]["fixed_precision_schedule"]
+    if fixed is not None:
+        warmup = cfg["feedback"]["warmup_rounds"]
+        charges = protocol.charges(np.arange(1, protocol.rounds + 1), fixed)
+        if (
+            any(z != protocol.z0 for z in fixed[:warmup])
+            or np.any(np.asarray(fixed) < protocol.z_floor)
+            or np.any(charges.sum(axis=0) > protocol.caps)
+        ):
+            raise ValueError("Fixed precision schedule must match warmup, respect the floor, and fit all three RDP caps")
     # Independent cross-check of optimized vectorized moments against the shared primitive.
     for g in range(3):
         actual = float(protocol.charges(1, protocol.z0)[g])

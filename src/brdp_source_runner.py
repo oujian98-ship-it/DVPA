@@ -76,12 +76,15 @@ def run(config, output, operational_progress=None):
     )
     train, test = load_datasets(cfg)
     if "public_train_file" in cfg:
-        from .dvpa_public_training import partition_record, evaluation_record
+        from .dvpa_public_training import client_training_count, partition_record, evaluation_record
         data_cfg = public_training_data_config(cfg)
         _json(out / "data_partition_protocol.json", partition_record(data_cfg))
         evaluation = evaluation_record(data_cfg, cfg["public_train_sha256"])
-        if len(train) != (60000 - cfg.get("public_train_count", 1000)) or len(test) != 10000:
+        if len(train) != client_training_count(cfg) or len(test) != cfg.get("validation_count", 10000):
             raise ValueError("Training-public baseline has unexpected client / test sizes")
+    elif "public_test_count" in cfg:
+        from .dvpa_test_public64 import evaluation_data
+        test, evaluation = evaluation_data(cfg, test)
     else:
         from .dvpa_dataset_support import baseline_evaluation
         test, evaluation = baseline_evaluation(cfg, test)
@@ -337,8 +340,13 @@ def run(config, output, operational_progress=None):
         for i in range(cfg["clients"])
     ]
     if "public_train_file" in cfg:
-        summary["client_training_examples"] = (60000 - cfg.get("public_train_count", 1000))
+        summary["client_training_examples"] = client_training_count(cfg)
         summary["public_source"] = "official_training_split"
+        if "validation_count" in cfg:
+            summary["evaluation_split"] = "independent_validation"
+    elif "public_test_count" in cfg and evaluation is not None:
+        summary.update({key: evaluation[key] for key in
+                        ("evaluation_split", "public_source", "client_training_examples")})
     write_csv(out / "client_privacy.csv", client_rows)
     _json(out / "summary.json", summary)
     _json(

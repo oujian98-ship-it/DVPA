@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from src.dvpa_audit import audit
-from src.dvpa_config import ROOT, load_config, public_preflight, resolve, smoke_config
+from src.dvpa_config import DEFAULT_CONFIG, ROOT, load_config, public_preflight, resolve, smoke_config
 from src.dvpa_controller import DecisionValueController
 from src.dvpa_feedback import DPHistoryFeedback
 from src.dvpa_filter import GroupRDPFilter
@@ -49,6 +49,34 @@ def test_one_observation_and_zero_velocity_keep_current_curve():
     assert forecast_coefficients(history, np.array([1, 2]), 0, 0.75) == pytest.approx(
         np.broadcast_to(history[-1], (2, 4))
     )
+
+
+def test_default_hfull_continues_beyond_the_former_25_round_limit():
+    cfg = load_config(DEFAULT_CONFIG)
+    cfg["base"]["rounds"] = 32
+    protocol = public_preflight(cfg)
+    feedback = DPHistoryFeedback(protocol)
+    ledger = GroupRDPFilter(protocol)
+
+    for t in (1, 2):
+        feedback.prepare(t)
+        coefficients = np.array([1.0 + t, 3.0, 4.0, 5.0 - t])
+        coefficients *= sum(protocol.dimensions.values()) / coefficients.sum()
+        feedback.set_public_coefficients(t, dict(
+            round=t, names=list(protocol.dimensions), coefficients=coefficients,
+            traces=coefficients * t, public_data_sha256=cfg["feedback"]["public_proxy_sha256"],
+        ))
+        if t == 1:
+            action, _ = DecisionValueController(protocol).choose(t, feedback, ledger.remaining())
+            certified = ledger.certify(action)
+            ledger.reserve(certified)
+            released = {name: torch.zeros(size) for name, size in protocol.dimensions.items()}
+            feedback.observe(t, released, certified)
+
+    forecast = feedback.public_forecast_coefficients
+    assert forecast.shape == (31, 4)  # Current round 2 plus rounds 3 through 32.
+    assert not np.array_equal(forecast[25], forecast[-1])
+    assert feedback.curvature_future_scale[25] != feedback.curvature_future_scale[-1]
 
 
 @pytest.mark.parametrize(

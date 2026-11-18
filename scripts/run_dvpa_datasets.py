@@ -4,7 +4,6 @@ import argparse
 import contextlib
 import copy
 import gc
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,11 +29,8 @@ from src.brdp_source_protocol import load_datasets, partition_and_groups, prefli
 from src.brdp_source_runner import _json, run as run_baseline
 from src.data import split_checksum
 from src.dvpa_audit import audit as audit_dvpa
-from src.dvpa_config import ROOT, load_config, public_preflight, resolve, smoke_config
-from src.dvpa_dataset_support import (
-    PublicCurvatureProxy, baseline_evaluation, create_transfer_validation,
-    make_public_mnist, verify_forecast_validation, verify_public_validation,
-)
+from src.dvpa_config import DEFAULT_CONFIG, ROOT, load_config, public_preflight, resolve, smoke_config
+from src.dvpa_test_public64 import PUBLIC_COUNT, TEST_COUNT, configure, evaluation_data
 from src.dvpa_runner import inside_output, run as run_dvpa
 from src.layer_registry import LayerRegistry
 from src.metrics import evaluate
@@ -46,27 +42,15 @@ SEEDS = (42, 43, 44)
 LABELS = ("DVPA", "IDP_FedAvg", "Time_Adaptive")
 TITLES = {"DVPA": "当前 DVPA", "IDP_FedAvg": "IDP-FedAvg 适配版",
           "Time_Adaptive": "spend-as-you-go 适配版"}
-CONFIG_DIR = ROOT / "configs/dvpa_datasets_20261105"
+CONFIG_DIR = ROOT / "configs/dvpa_datasets_test64"
 
 
 def configuration(dataset, seed, smoke=False):
     if dataset not in DATASETS or seed not in SEEDS:
         raise ValueError("Only requested two datasets and seeds42/43/44 are allowed")
-    cfg = load_config(ROOT / "configs/dvpa_fmnist_forecast_seed42.yaml")
+    cfg = load_config(DEFAULT_CONFIG)
     cfg["base"].update(dataset=dataset, seed=seed)
-    if dataset == "mnist":
-        path = ROOT / "data/public_mnist_proxy.pt"
-        cfg["feedback"].update(
-            public_proxy_file="data/public_mnist_proxy.pt",
-            public_proxy_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-            public_proxy_validation="reports/dvpa_datasets/mnist_transfer_validation.json",
-            forecast_validation="reports/dvpa_datasets/mnist_transfer_validation.json",
-        )
-    cfg["base"].update(
-        evaluation_public_file=cfg["feedback"]["public_proxy_file"],
-        evaluation_public_sha256=cfg["feedback"]["public_proxy_sha256"],
-    )
-    cfg = resolve(cfg)
+    cfg = resolve(configure(cfg))
     if smoke:
         cfg = smoke_config(cfg)
         cfg["feedback"]["public_proxy_probes"] = 2
@@ -97,19 +81,6 @@ def jobs(datasets=DATASETS, seeds=SEEDS, smoke=False):
 def prepare():
     """Create all input artifacts BEFORE the exact-source regression gate."""
     torch.set_num_threads(1)
-    original = load_config(ROOT / "configs/dvpa_fmnist_forecast_seed42.yaml")
-    verify_public_validation(original)
-    verify_forecast_validation(original)
-    path = ROOT / "data/public_mnist_proxy.pt"
-    if not path.exists():
-        make_public_mnist(path, original["base"]["data_root"])
-    config = configuration("mnist", 42)
-    directory = ROOT / "reports/dvpa_datasets"
-    directory.mkdir(parents=True, exist_ok=True)
-    proof = create_transfer_validation(config)
-    _json(directory / "mnist_transfer_validation.json", proof)
-    verify_public_validation(config)
-    verify_forecast_validation(config)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     records = jobs()
     for job in records:
@@ -119,8 +90,8 @@ def prepare():
     for dataset in DATASETS:
         cfg = configuration(dataset, 42)
         train, test = load_datasets(cfg["base"])
-        held, evaluation = baseline_evaluation(cfg["base"], test)
-        if len(train) != 60000 or len(held) != 9000:
+        held, evaluation = evaluation_data(cfg["base"], test)
+        if len(train) != 60000 or len(held) != TEST_COUNT - PUBLIC_COUNT:
             raise ValueError("Formal dataset size mismatch")
         inputs[dataset] = dict(train=dataset_digest(train), full_test=dataset_digest(test),
                                evaluation=evaluation, training_examples=len(train))
@@ -133,9 +104,7 @@ def prepare():
         fees[job["label"]] = public.as_dict() if job["label"] == "DVPA" else dict(
             final_epsilon=public["final_epsilon"], counts=public["counts"].tolist())
     result = dict(status="passed", jobs=18, datasets=inputs, privacy_preflights=fees,
-                  frozen_source_config="configs/dvpa_fmnist_forecast_seed42.yaml",
-                  mnist_validation_kind=proof["validation_kind"],
-                  mnist_empirical_benefit_validated=False,
+                  frozen_source_config=DEFAULT_CONFIG.relative_to(ROOT).as_posix(),
                   configurations=[j["name"] + ".yaml" for j in records])
     _json(CONFIG_DIR / "manifest.json", result)
     print(json.dumps(dict(status="prepared", jobs=18, datasets=list(inputs)), ensure_ascii=False), flush=True)
@@ -192,12 +161,12 @@ def report(out, state):
         paired=paired, privacy_policy="common per-run caps10/20/30; actual costs reported; not equal consumption"))
     lines = ["# 当前 DVPA 与两条 baseline：FMNIST / MNIST × seeds42、43、44", "",
         f"状态：{state['status']}；完成 {len(rows)}/{state['expected_runs']} 次。当前任务：{state.get('current_job')}。", "",
-        "所有方法每次全新训练；每数据集60,000张训练、固定1,000张公开机制数据、其余同一9,000张评估。",
+        "所有方法均用官方训练集的 60,000 张图训练。官方测试集固定预留 64 张用于公开曲率，其余 9,936 张用于所有方法的评测。",
         "同数据集同seed共用分区、隐私组和CNN初始化。100客户端，25轮，每轮所有客户端30本地epochs，batch125。",
         "主指标固定为第25轮准确率；中途最高值另列，不按测试最高值选最终模型。样本标准差采用ddof=1。",
-        "当前DVPA完整保留排名检查、细搜索、公开曲率和短期预测；第三项协方差校准停用。",
+        "DVPA 沿用公开曲率、方向反馈、连续凸规划和 VOI（权重 15），曲率趋势传播至末轮。",
         "IDP保留恒定q=.9；SAYG保留原递推与分阶段q。各自裁剪/噪声/有效会计保留，是同上限完整方法比较。",
-        "MNIST固定迁移FMNIST的控制参数，只有公开输入与数值检查，不声称已有MNIST代理收益验证。", ""]
+        "MNIST 沿用 FMNIST 的控制参数。64 张曲率样本通过来源与划分检查，其预测收益需由新实验验证。", ""]
     for dataset in DATASETS:
         lines += [f"## {dataset.upper()}", "", "| 方法 | n | seed42 | seed43 | seed44 | 最终均值±样本标准差 |", "|---|---:|---:|---:|---:|---:|"]
         for label in LABELS:
@@ -242,13 +211,10 @@ def run_suite(output, datasets=DATASETS, seeds=SEEDS, smoke=False, enforce_gate=
         for dataset in datasets:
             cfg = next(j["config"] for j in records if j["dataset"] == dataset and j["label"] == "DVPA")
             train, test = load_datasets(cfg["base"])
-            _, evaluation = baseline_evaluation(cfg["base"], test)
+            _, evaluation = evaluation_data(cfg["base"], test)
             input_records[dataset] = dict(train=dataset_digest(train), test=dataset_digest(test), evaluation=evaluation)
             for seed in seeds:
                 dc = next(j["config"] for j in records if j["dataset"] == dataset and j["seed"] == seed and j["label"] == "DVPA")
-                if not smoke:
-                    verify_public_validation(dc)
-                    verify_forecast_validation(dc)
                 parts, ids = partition_and_groups(dc["base"], train.tensors[1])
                 torch.manual_seed(seed)
                 for _ in range(dc["base"]["clients"]):
@@ -284,7 +250,7 @@ def run_suite(output, datasets=DATASETS, seeds=SEEDS, smoke=False, enforce_gate=
                     identity = verify_identity(folder, expected[job["dataset"], job["seed"]])
                     base = job["config"]["base"] if is_dvpa else job["config"]
                     _, test = load_datasets(base)
-                    test, _ = baseline_evaluation(base, test)
+                    test, _ = evaluation_data(base, test)
                     model = source_model()(job["dataset"], base["batch_size"]).to("cuda:0" if torch.cuda.is_available() else "cpu")
                     model.load_state_dict(torch.load(folder / "model.pt", weights_only=True, map_location=next(model.parameters()).device))
                     loss, accuracy = evaluate(model, test, next(model.parameters()).device)

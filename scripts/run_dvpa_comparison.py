@@ -25,8 +25,9 @@ from src.brdp_source_protocol import load_datasets, partition_and_groups, prefli
 from src.brdp_source_runner import _json, run as run_baseline
 from src.data import split_checksum
 from src.dvpa_audit import audit as audit_dvpa
-from src.dvpa_config import ROOT, load_config, public_preflight, smoke_config
+from src.dvpa_config import DEFAULT_CONFIG, ROOT, load_config, public_preflight, smoke_config
 from src.dvpa_runner import inside_output, run as run_dvpa
+from src.dvpa_test_public64 import evaluation_data
 from src.layer_registry import LayerRegistry
 from src.st_runner import write_csv
 from src.upstream_runner import source_model
@@ -49,7 +50,7 @@ def jobs(seeds, smoke=False, device=None):
         raise ValueError("Unique nonnegative integer seeds required")
     result = []
     for seed in seeds:
-        dvpa = load_config(ROOT / "configs/dvpa_fmnist.yaml")
+        dvpa = load_config(DEFAULT_CONFIG)
         if smoke:
             dvpa = smoke_config(dvpa)
         dvpa["base"]["seed"] = seed
@@ -333,8 +334,10 @@ def run_suite(output, seeds=(42,), smoke=False, device=None, enforce_gate=True):
     anchors = {}
     try:
         torch.set_num_threads(1)
-        train, test = load_datasets(records[0]["config"]["base"])
+        base = records[0]["config"]["base"]
+        train, test = load_datasets(base)
         input_hashes = dict(train=dataset_digest(train), test=dataset_digest(test))
+        _, evaluation = evaluation_data(base, test)
         dimensions = LayerRegistry(
             source_model()("fmnist", records[0]["config"]["base"]["batch_size"])
         ).dimensions
@@ -381,8 +384,9 @@ def run_suite(output, seeds=(42,), smoke=False, device=None, enforce_gate=True):
             dict(
                 dataset_scope="synthetic engineering"
                 if smoke
-                else "official FMNIST 60000/10000",
+                else "official FMNIST with 60,000 training and 9,936 evaluation images",
                 dataset_sha256=input_hashes,
+                evaluation=evaluation,
                 parameters=sum(dimensions.values()),
                 expected_identity=expected,
                 public_plans=public_plans,

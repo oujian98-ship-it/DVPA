@@ -9,11 +9,12 @@ import torch
 
 from scripts.run_dvpa_datasets import configuration, jobs, run_suite, statistics
 from src.brdp_source_protocol import load_datasets, validate_config
-from src.dvpa_config import ROOT
+from src.dvpa_config import ROOT, load_config, resolve
 from src.dvpa_dataset_support import (
-    PublicCurvatureProxy, baseline_evaluation, read_package,
+    PublicCurvatureProxy,
     verify_forecast_validation, verify_public_validation,
 )
+from src.dvpa_test_public64 import evaluation_data, read_package
 
 
 def test_full_eighteen_jobs_preserve_current_controller_and_common_training():
@@ -27,19 +28,22 @@ def test_full_eighteen_jobs_preserve_current_controller_and_common_training():
             assert cfg["controller"] == reference["controller"]
             assert cfg["feedback"]["extra_covariance"] == "dp_innovation"
             assert cfg["feedback"]["curvature_forecast"] == "damped_log_trend"
+            assert cfg["feedback"]["forecast_horizon"] == "full"
             assert cfg["base"]["rounds"] == 25 and cfg["base"]["local_epochs"] == 30
             for j in group[1:]:
                 assert all(j["config"][k] == v for k, v in cfg["base"].items() if k != "method")
 
 
 def test_mnist_cannot_use_fmnist_public_inputs_or_fake_empirical_benefit():
-    cfg = configuration("mnist", 42)
+    # Check the legacy certificate against the original, archived configuration.
+    cfg = load_config(ROOT / "configs/dvpa_datasets_20261105/mnist_DVPA_seed42.yaml")
     public = PublicCurvatureProxy(cfg)
     assert public.metadata["dataset"] == "MNIST official test split"
     assert len(public.final_indices) == 9000 and len(public.images) == 64
     bad = copy.deepcopy(cfg)
-    bad["feedback"].update(reference := {k: configuration("fmnist", 42)["feedback"][k]
-                          for k in ("public_proxy_file", "public_proxy_sha256")})
+    legacy_fmnist = load_config(ROOT / "configs/dvpa_datasets_20261105/fmnist_DVPA_seed42.yaml")
+    bad["feedback"].update({k: legacy_fmnist["feedback"][k]
+                            for k in ("public_proxy_file", "public_proxy_sha256")})
     with pytest.raises(ValueError, match="identity"):
         PublicCurvatureProxy(bad)
     proof = verify_public_validation(cfg)
@@ -55,22 +59,39 @@ def test_mnist_cannot_use_fmnist_public_inputs_or_fake_empirical_benefit():
         verify_forecast_validation(cfg, altered)
 
 
-def test_official_heldout_split_matches_actual_images_and_rejects_wrong_dataset():
+@pytest.mark.parametrize("dataset", ["mnist", "fmnist"])
+def test_official_heldout_split_matches_actual_images_and_rejects_wrong_dataset(dataset):
     torch.set_num_threads(1)
-    cfg = configuration("mnist", 42)["base"]
+    full_cfg = configuration(dataset, 42)
+    cfg = full_cfg["base"]
     train, test = load_datasets(cfg)
-    held, evaluation = baseline_evaluation(cfg, test)
-    assert len(train) == 60000 and len(held) == 9000
-    assert evaluation["dataset"] == "MNIST"
-    assert torch.equal(held.dataset.tensors[0], test.tensors[0])
+    held, evaluation = evaluation_data(cfg, test)
+    assert len(train) == 60000 and len(test) == 10000 and len(held) == 9936
+    assert evaluation["dataset"] == dataset.upper() and evaluation["evaluation_split"] == "official_test_holdout"
+    assert held.dataset is test
+    public = evaluation["public_test_indices"]
+    assert len(public) == 64 and not (set(public) & set(held.indices))
+    assert set(public) | set(held.indices) == set(range(len(test)))
+    assert configuration(dataset, 43)["base"]["evaluation_public_sha256"] == cfg["evaluation_public_sha256"]
+    _, _, package = read_package(cfg)
+    assert torch.equal(package["images"], test.tensors[0][public])
+    assert "labels" not in package
+    test.tensors[0][public[0]].zero_()
+    with pytest.raises(ValueError, match="differ from"):
+        evaluation_data(cfg, test)
     wrong = copy.deepcopy(cfg)
-    wrong["dataset"] = "fmnist"
+    wrong["dataset"] = "fmnist" if dataset == "mnist" else "mnist"
     with pytest.raises(ValueError, match="identity"):
-        baseline_evaluation(wrong, test)
+        evaluation_data(wrong, test)
     bad = copy.deepcopy(cfg)
     bad.pop("evaluation_public_sha256")
     with pytest.raises(ValueError, match="together"):
         validate_config(bad)
+    with pytest.raises(ValueError, match="full training split"):
+        validate_config(dict(cfg, validation_count=5000))
+    full_cfg["feedback"]["public_proxy_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="reserved official"):
+        resolve(full_cfg)
 
 
 def test_statistics_use_sample_sd_and_separate_datasets_and_duplicates():

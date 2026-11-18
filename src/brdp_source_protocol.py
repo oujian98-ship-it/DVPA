@@ -70,9 +70,11 @@ def validate_config(config):
         "calibration_epsilons",
         "evaluation_public_file",
         "evaluation_public_sha256",
+        "public_test_count",
         "public_train_file",
         "public_train_sha256",
         "public_train_count",
+        "validation_count",
     }
     if not isinstance(cfg, dict) or not required <= set(cfg) or set(cfg) - allowed:
         raise ValueError("Unknown or missing source-protocol configuration fields")
@@ -182,8 +184,20 @@ def validate_config(config):
         raise ValueError("Formal protocol uses full clean official train/test splits")
     if ("evaluation_public_file" in cfg) != ("evaluation_public_sha256" in cfg):
         raise ValueError("Evaluation package and digest must be supplied together")
+    if "public_test_count" in cfg:
+        from .dvpa_test_public64 import PUBLIC_COUNT
+
+        if (type(cfg["public_test_count"]) is not int or cfg["public_test_count"] != PUBLIC_COUNT
+                or "evaluation_public_file" not in cfg
+                or {"public_train_file", "public_train_sha256", "public_train_count", "validation_count"} & cfg.keys()):
+            raise ValueError("Test64 requires a pinned evaluation package and the full training split")
     if "public_train_count" in cfg and "public_train_file" not in cfg:
         raise ValueError("Public count requires a pinned training-public package")
+    if "validation_count" in cfg and (
+        type(cfg["validation_count"]) is not int or not 1 <= cfg["validation_count"] <= 10000
+        or "public_train_file" not in cfg or cfg.get("dataset_mode", "official") != "official"
+    ):
+        raise ValueError("Independent validation requires an official training-public split")
     if "public_train_file" in cfg or "public_train_sha256" in cfg:
         from .dvpa_public_training import validate_public_train_config
         validate_public_train_config(public_training_data_config(cfg))
@@ -193,6 +207,10 @@ def validate_config(config):
 def load_datasets(cfg):
     from .data import load_data
 
+    if "validation_count" in cfg:
+        from .dvpa_public_training import load_train_validation
+
+        return load_train_validation(public_training_data_config(cfg))
     if cfg.get("dataset_mode") == "synthetic":
         rng = torch.Generator().manual_seed(cfg["seed"])
         count = max(40 * cfg["clients"], cfg.get("synthetic_samples", 600))

@@ -13,6 +13,7 @@ from numpy.polynomial.hermite import hermgauss
 import torch
 
 from .brdp_direction import DirectionState, direction_hash
+from .dvpa_energy_feedback import LayerEnergyState, energy_observations
 from .dvpa_filter import digest
 
 
@@ -45,6 +46,10 @@ class DPHistoryFeedback:
         self.protocol = protocol
         self.cfg = protocol.config["feedback"]
         self.names = list(protocol.dimensions)
+        self.energy = LayerEnergyState(protocol) if self.cfg["feedback_mode"] == "energy" else None
+        self.curvature_only = protocol.config["controller"]["curvature_only"] or (
+            protocol.config["controller"]["layer_policy"] in {"p_curv", "p_mix"}
+        )
         self.direction = DirectionState(protocol.dimensions)
         self.basis = None
         self.basis_hash = "warmup:none"
@@ -75,6 +80,12 @@ class DPHistoryFeedback:
         self.public_coefficient_round = 0
         self.public_coefficient_history = []
         self.public_forecast_coefficients = None
+        self.curvature_scale_reference = None
+        self.curvature_scale = 1.0
+        self.curvature_log_mass = []
+        self.curvature_future_scale = None
+        if self.energy is not None:
+            self.basis_hash = digest(self.cfg["energy_state"])
 
     def set_public_coefficients(self, t, report):
         coefficients = np.array(report["coefficients"], dtype=float)
@@ -98,6 +109,26 @@ class DPHistoryFeedback:
             )
         self.public_coefficients = coefficients.copy()
         self.public_coefficient_round = t
+        # Full forecasts use the training horizon, including runs beyond 25 rounds.
+        horizon = self.cfg["forecast_horizon"]
+        if horizon == "full":
+            horizon = self.protocol.rounds
+        if self.cfg["curvature_mode"] == "absolute_scale":
+            traces = np.asarray(report["traces"], dtype=float)
+            if traces.shape != coefficients.shape or not np.isfinite(traces).all() or (traces <= 0).any():
+                raise ValueError("Absolute scale requires positive finite public traces")
+            mass = float(traces.sum())
+            if self.curvature_scale_reference is None:
+                self.curvature_scale_reference = mass
+            self.curvature_scale = mass / self.curvature_scale_reference
+            self.curvature_log_mass.append(math.log(self.curvature_scale))
+            recent = np.diff(self.curvature_log_mass[-4:])
+            velocity = float(np.clip(np.median(recent), -0.25, 0.25)) if len(recent) else 0.0
+            damping = self.cfg["forecast_damping"]
+            weights = np.array([sum(damping**j for j in range(1, min(step, horizon) + 1))
+                                for step in range(self.protocol.rounds - t + 1)])
+            self.curvature_future_scale = self.curvature_scale * np.exp(velocity * weights)
+            self.public_coefficients *= self.curvature_scale
         if self.cfg["curvature_forecast"] == "damped_log_trend":
             from .dvpa_forecast import forecast_coefficients, parameters_from_config
 
@@ -106,24 +137,37 @@ class DPHistoryFeedback:
                     "Public forecast history must be a complete causal prefix"
                 )
             self.public_coefficient_history.append(coefficients.copy())
+            parameters = parameters_from_config(self.cfg)
+            parameters["horizon"] = horizon
             self.public_forecast_coefficients = forecast_coefficients(
                 self.public_coefficient_history,
                 np.arange(self.protocol.rounds - t + 1),
-                **parameters_from_config(self.cfg),
+                **parameters,
             )
+            if self.curvature_future_scale is not None:
+                self.public_forecast_coefficients *= self.curvature_future_scale[:, None]
 
     def public_forecast_record(self):
         if self.cfg["curvature_forecast"] == "hold_current":
             return {}
         from .dvpa_forecast import parameters_from_config
 
-        return dict(
-            forecast="causal damped relative-log trend; hold horizon endpoint",
+        record = dict(
+            forecast=(
+                "causal damped relative-log trend through the final round"
+                if self.cfg["forecast_horizon"] == "full"
+                else "causal damped relative-log trend; hold horizon endpoint"
+            ),
             forecast_parameters=parameters_from_config(self.cfg),
             forecast_observed_rounds=len(self.public_coefficient_history),
             forecast_coefficients=self.public_forecast_coefficients.tolist(),
             forecast_scope="deterministic given past public curvature; virtual observations update original direction belief only",
         )
+        if self.curvature_future_scale is not None:
+            record.update(curvature_mode=self.cfg["curvature_mode"],
+                          curvature_scale_reference=self.curvature_scale_reference,
+                          curvature_future_scale=self.curvature_future_scale.tolist())
+        return record
 
     def _sampling_bound(self, rates):
         q = np.asarray(rates)
@@ -145,7 +189,7 @@ class DPHistoryFeedback:
             or self.prepared_round == t
         ):
             raise ValueError("Prediction requires exactly previous published history")
-        if t == self.cfg["warmup_rounds"] + 1:
+        if self.energy is None and t == self.cfg["warmup_rounds"] + 1:
             old = self.direction.for_round(t)
             rng = np.random.default_rng(
                 self.protocol.config["controller"]["public_seed"] + 9173
@@ -208,6 +252,9 @@ class DPHistoryFeedback:
     def expected_costs(self, means, covariance, rounds, origin, quadrature_nodes=None):
         """E[K], never E[oracle minimum]. Batch x future rounds x four blocks."""
         means = np.atleast_2d(means)
+        if self.curvature_only:
+            costs = self.pure_public_costs(rounds, origin)
+            return np.broadcast_to(costs, (len(means), *costs.shape))
         rounds = np.asarray(rounds, dtype=int)
         steps = rounds - origin
         if (steps < 0).any():
@@ -237,6 +284,14 @@ class DPHistoryFeedback:
             (squared / (self.cfg["signal_scale"] ** 2 + squared)) * weights, axis=-1
         ) / math.sqrt(math.pi)
         importance = self.cfg["lambda0"] + self.cfg["lambda1"] * saturated
+        return importance * self.pure_public_costs(rounds, origin)[None, :, :]
+
+    def pure_public_costs(self, rounds, origin):
+        """Unmodulated curvature coefficient in the planner's noise-loss units."""
+        rounds = np.asarray(rounds, dtype=int)
+        steps = rounds - origin
+        if (steps < 0).any():
+            raise ValueError("Cannot forecast backwards")
         layer_cost = np.array(list(self.protocol.dimensions.values()))
         if self.cfg["utility_proxy"] == "public_curvature_signal":
             if (
@@ -246,6 +301,8 @@ class DPHistoryFeedback:
                 raise ValueError("Prepare public curvature before scoring actions")
             layer_cost = self.public_coefficients
         layer_costs = np.broadcast_to(layer_cost, (len(rounds), 4))
+        if self.curvature_future_scale is not None and self.cfg["curvature_forecast"] == "hold_current":
+            layer_costs = layer_costs * (self.curvature_future_scale[steps] / self.curvature_scale)[:, None]
         if self.cfg["curvature_forecast"] == "damped_log_trend":
             if (
                 origin != self.public_coefficient_round
@@ -253,8 +310,7 @@ class DPHistoryFeedback:
             ):
                 raise ValueError("Future scoring requires the current causal forecast")
             layer_costs = self.public_forecast_coefficients[steps]
-        coefficient = layer_costs * self.protocol.scales[rounds - 1, None] ** 2 / 4
-        return importance * coefficient[None, :, :]
+        return layer_costs * self.protocol.scales[rounds - 1, None] ** 2 / 4
 
     def observe(self, t, released, certified):
         action = certified.action
@@ -272,7 +328,11 @@ class DPHistoryFeedback:
             raise ValueError("Invalid released update shape")
         new_hash = release_hash(released, self.names)
         rows = []
-        if self.basis is not None:
+        if self.energy is not None:
+            rows = energy_observations(released, certified, self.protocol.dimensions,
+                                       self.protocol.base["seed"])
+            self.energy.observe(t, rows)
+        elif self.basis is not None:
             scale = certified.source_plan.final_scale * self.cfg["reference_clip"] * 0.5
             x = np.array(
                 [
@@ -330,7 +390,8 @@ class DPHistoryFeedback:
         else:
             self.mean = self.pred_mean.copy()
             self.cov = self.pred_cov.copy()
-        self.direction.observe(t, released)
+        if self.energy is None:
+            self.direction.observe(t, released)
         self.history_hash = digest(
             dict(previous=self.history_hash, round=t, release=new_hash)
         )
@@ -349,6 +410,8 @@ class DPHistoryFeedback:
             last_observed=self.last_observed,
             direction=self.direction.state_dict(),
         )
+        if self.energy is not None:
+            state["energy"] = self.energy.state_dict()
         if self.cfg["utility_proxy"] == "public_curvature_signal":
             state["public_proxy"] = dict(
                 coefficients=None

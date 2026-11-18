@@ -25,7 +25,7 @@ from .dvpa_filter import GroupRDPFilter, PrecisionAction, VERSION, digest
 from .brdp_source_protocol import SourceRoundPlan
 from .layer_registry import LayerRegistry
 from .upstream_runner import SOURCE, source_model
-from .dvpa_public_training import evaluation_record as train_public_evaluation
+from .dvpa_public_training import client_training_count, evaluation_record as train_public_evaluation
 
 
 def _equal(actual, expected, label="artifact"):
@@ -109,6 +109,7 @@ def audit(directory):
     if (
         cfg["feedback"]["curvature_forecast"] != "hold_current"
         and cfg["base"].get("dataset_mode") != "synthetic"
+        and "public_test_count" not in cfg["base"]
     ):
         if "public_train_file" in cfg["base"]:
             from .dvpa_public_training import verify_validation as verify_forecast_validation
@@ -139,7 +140,7 @@ def audit(directory):
     count = (
         max(40 * protocol.base["clients"], protocol.base.get("synthetic_samples", 600))
         if protocol.base.get("dataset_mode") == "synthetic"
-        else ((60000 - cfg["base"].get("public_train_count", 1000)) if "public_train_file" in cfg["base"] else 60000)
+        else client_training_count(cfg["base"])
     )
     if (
         len(partition["parts"]) != protocol.base["clients"]
@@ -176,7 +177,14 @@ def audit(directory):
         raise ValueError("Action/release count mismatch")
     filter_ = GroupRDPFilter(protocol)
     feedback = DPHistoryFeedback(protocol)
-    controller = DecisionValueController(protocol)
+    predictor = None
+    if cfg["controller"]["voi_explore_p_only"]:
+        from .dvpa_energy_voi import load_energy_gate
+
+        predictor, _ = load_energy_gate(cfg, root / "energy_gate.json")
+        if len(list((root / "energy_ranking").glob("*.json"))) != protocol.rounds:
+            raise ValueError("Energy decision record coverage mismatch")
+    controller = DecisionValueController(protocol, predictor)
     public_proxy = None
     if "public_train_file" in cfg["base"]:
         from .dvpa_public_training import partition_record, verify_validation
@@ -184,7 +192,9 @@ def audit(directory):
                partition_record(cfg["base"]), "training_public_split")
         verify_validation(cfg, json.loads((root / "public_validation.json").read_text(encoding="utf-8")))
     if cfg["feedback"]["utility_proxy"] == "public_curvature_signal":
-        if "public_train_file" in cfg["base"]:
+        if "public_test_count" in cfg["base"]:
+            from .dvpa_test_public64 import PublicCurvatureProxy
+        elif "public_train_file" in cfg["base"]:
             from .dvpa_public_training import PublicCurvatureProxy
         else:
             from .dvpa_dataset_support import PublicCurvatureProxy
@@ -217,6 +227,9 @@ def audit(directory):
                 "public_proxy",
             )
         expected_action, decision = controller.choose(t, feedback, filter_.remaining())
+        if predictor is not None:
+            _equal(json.loads((root / "energy_ranking" / f"round_{t:03d}.json").read_text(encoding="utf-8")),
+                   controller.last_energy_ranking, "energy_ranking")
         if cfg["controller"]["ranking_enabled"]:
             ranking_decisions.append(decision)
         if cfg["controller"]["ranking_enabled"]:
@@ -326,10 +339,14 @@ def audit(directory):
     ):
         raise ValueError("Final model does not equal accumulated DP releases")
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    from .dvpa_test_public64 import verify_evaluation
+
+    verify_evaluation(cfg["base"], root, summary)
     if public_proxy is not None:
         expected_count = (
-            (10000 if "public_train_file" in cfg["base"] else 9000)
-            if cfg["base"].get("dataset_mode") != "synthetic" else None
+            (cfg["base"].get("validation_count", 10000) if "public_train_file" in cfg["base"] else 9000)
+            if cfg["base"].get("dataset_mode") != "synthetic"
+            and "public_test_count" not in cfg["base"] else None
         )
         if expected_count is not None:
             _equal(
@@ -350,6 +367,8 @@ def audit(directory):
                 "evaluation_protocol",
             )
         _equal(summary["utility_proxy"], "public_curvature_signal", "utility_proxy")
+        if "validation_count" in cfg["base"]:
+            _equal(summary["evaluation_split"], "independent_validation", "evaluation_split")
         if cfg["feedback"]["curvature_forecast"] != "hold_current":
             _equal(
                 summary["curvature_forecast"],
